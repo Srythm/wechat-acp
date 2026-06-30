@@ -65,8 +65,21 @@ export async function uploadToCdn(params: {
     body: encrypted,
   });
 
-  if (!res.ok) throw new Error(`CDN upload failed: HTTP ${res.status}`);
+  if (!res.ok) {
+    // Include the gateway's x-error-code header and body in the error so
+    // callers can diagnose why the CDN rejected the upload. Keep it concise
+    // (no full URL/headers dump, which may contain sensitive params).
+    const errCode = res.headers.get("x-error-code");
+    const bodyText = await res.text().catch(() => "");
+    throw new Error(
+      `CDN upload failed: HTTP ${res.status}` +
+        (errCode ? ` (x-error-code: ${errCode})` : "") +
+        (bodyText ? `: ${bodyText.slice(0, 200)}` : ""),
+    );
+  }
   const downloadParam = res.headers.get("x-encrypted-param");
-  if (!downloadParam) throw new Error("CDN upload: missing x-encrypted-param header");
+  if (!downloadParam) {
+    throw new Error("CDN upload: missing x-encrypted-param header");
+  }
   return downloadParam;
 }

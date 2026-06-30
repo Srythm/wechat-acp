@@ -77,6 +77,10 @@ Options:
   --max-sessions <n>  Max concurrent user sessions (default: 10)
   --hide-thoughts     Do not forward agent thinking to WeChat (default: forwarded)
   --show-diffs        Forward ACP file diffs to WeChat (default: hidden)
+  --system-prompt <t> Override the default system prompt prepended to each
+                      user message (default informs the agent that referencing
+                      local image files will forward them as WeChat images)
+  --no-system-prompt  Disable system prompt injection entirely
   --text <text>       Message text for "inject"
   --file <path>       Read injected message text from a file
   --to <target>       Injection target (default: ${DEFAULT_INJECTION_TARGET})
@@ -136,6 +140,8 @@ function parseArgs(argv: string[]): {
   injectContextToken?: string;
   hideThoughts: boolean;
   showDiffs: boolean;
+  noSystemPrompt: boolean;
+  systemPrompt?: string;
   verbose: boolean;
   version: boolean;
   help: boolean;
@@ -146,6 +152,7 @@ function parseArgs(argv: string[]): {
     disableInbox: false,
     hideThoughts: false,
     showDiffs: false,
+    noSystemPrompt: false,
     verbose: false,
     version: false,
     help: false,
@@ -210,6 +217,12 @@ function parseArgs(argv: string[]): {
         break;
       case "--show-diffs":
         result.showDiffs = true;
+        break;
+      case "--no-system-prompt":
+        result.noSystemPrompt = true;
+        break;
+      case "--system-prompt":
+        result.systemPrompt = args[++i];
         break;
       case "-v":
       case "--verbose":
@@ -491,6 +504,13 @@ async function main(): Promise<void> {
   if (args.maxSessions) config.session.maxConcurrentUsers = args.maxSessions;
   if (args.hideThoughts) config.agent.showThoughts = false;
   if (args.showDiffs) config.agent.showDiffs = true;
+  // --no-system-prompt disables injection; --system-prompt overrides the text.
+  // --no-system-prompt takes precedence if both are given.
+  if (args.noSystemPrompt) {
+    config.agent.systemPrompt = null;
+  } else if (args.systemPrompt !== undefined) {
+    config.agent.systemPrompt = args.systemPrompt;
+  }
   config.daemon.enabled = args.daemon;
 
   // Handle daemon mode

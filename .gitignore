@@ -27,3 +27,12 @@ Thumbs.db
 *.ntvs*
 *.njsproj
 *.sln
+
+# Local dev scratch files (reference packages, probe scripts, test images)
+_ref_openclaw/
+scripts/probe-*.ts
+sine.png
+sine.py
+
+# Documentation
+doc/

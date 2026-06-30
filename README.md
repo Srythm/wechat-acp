@@ -17,6 +17,7 @@ Bridge WeChat direct messages to any ACP-compatible AI agent.
 - Auto-allow permission requests from the agent
 - Direct message only; group chats are ignored
 - Background daemon mode
+- Bridge chat commands: `/acp-config`, `/acp-cancel`, `/acp-reset`, `/acp-prompt-start`, `/acp-prompt-done`
 
 ## Requirements
 
@@ -181,7 +182,7 @@ You can also override or add agent presets:
 
 ## Customizing bridge command names (aliases)
 
-Bridge slash commands like `/acp-config` and `/acp-cancel` have fixed
+Bridge slash commands like `/acp-config`, `/acp-cancel`, and `/acp-reset` have fixed
 built-in names that may not feel natural to everyone, and can clash with
 slash commands built into the underlying agent. You can map any bridge
 command to one or more custom aliases via the `commandAliases` config map:
@@ -216,7 +217,7 @@ Two alias styles are supported:
 
 Notes:
 
-- Keys must be a known bridge command (`/acp-config`, `/acp-cancel`, `/acp-prompt-start`, or `/acp-prompt-done`).
+- Keys must be a known bridge command (`/acp-config`, `/acp-cancel`, `/acp-reset`, `/acp-prompt-start`, or `/acp-prompt-done`).
 - An alias may not collide with a built-in command name or be mapped to
   more than one command. Invalid configs are rejected at startup.
 
@@ -269,6 +270,29 @@ Behavior:
 - If no turn is in flight, the command replies with a notice and is a no-op.
 - This command is handled by `wechat-acp` itself and is **not** forwarded to the underlying agent.
 - You can give this command your own aliases via `commandAliases` (see [Customizing bridge command names](#customizing-bridge-command-names-aliases)).
+
+## WeChat ACP reset command
+
+When a conversation context gets too long or you want to start fresh, you can reset the ACP session without restarting the bridge:
+
+```text
+/acp-reset
+```
+
+Behavior:
+
+- Kills the agent subprocess for the current user and removes the session.
+- Any in-flight turn is cancelled. Queued messages are rejected (local injections waiting on them will get an error).
+- The next message from the user automatically spawns a new agent subprocess with a clean conversation context.
+- If no session exists, the command replies with a notice and is a no-op.
+- This command is handled by `wechat-acp` itself and is **not** forwarded to the underlying agent.
+- You can give this command your own aliases via `commandAliases` (see [Customizing bridge command names](#customizing-bridge-command-names-aliases)).
+
+Use this when:
+
+- The agent's context window is filling up and replies start to degrade.
+- You want to switch topics completely without carrying over conversation history.
+- The agent process is in a bad state (though the bridge already auto-recovers from agent crashes).
 
 ## Multi-part message buffering
 
@@ -424,7 +448,7 @@ npm run dev
 WECHAT_ACP_TELEMETRY=0 npx wechat-acp --agent copilot
 ```
 
-**What is collected** (15 event types only):
+**What is collected** (16 event types only):
 
 - `app.start` / `app.stop` — process lifecycle, agent preset name, daemon flag, uptime
 - `login.success` / `login.failure` / `token.reused` — WeChat login outcomes (no token, no QR URL)
@@ -433,6 +457,7 @@ WECHAT_ACP_TELEMETRY=0 npx wechat-acp --agent copilot
 - `command.acp_config.view` — `/acp-config` invoked to list options; whether a session exists and the option count
 - `command.acp_config.set` — `/acp-config set` succeeded; `configId`, option type (`select` / `boolean`), and the resolved option value (all from the agent's declared `configOptions`, never the user's raw input)
 - `command.acp_cancel` — `/acp-cancel` invoked; whether the queue was drained, whether an in-flight turn was actually cancelled, and how many queued messages were dropped
+- `command.acp_reset` — `/acp-reset` invoked; whether an active session existed and was killed
 - `command.buffer_start` — `/acp-prompt-start` invoked to enter buffering mode
 - `command.buffer_done` — `/acp-prompt-done` invoked to flush buffer; number of content blocks collected
 - `session.created` — new ACP session opened

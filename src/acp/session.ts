@@ -65,6 +65,13 @@ export interface SessionManagerOpts {
   showDiffs?: boolean;
   log: (msg: string) => void;
   onReply: (userId: string, contextToken: string, text: string) => Promise<void>;
+  /**
+   * Delivers an agent-produced image to a WeChat user. Receives the raw
+   * ACP ImageContent (base64 `data` + `mimeType`). The bridge uploads it
+   * to the WeChat CDN and sends an image message. Optional: when omitted,
+   * image output from the agent is dropped (with a log line).
+   */
+  onImage?: (userId: string, contextToken: string, image: acp.ImageContent) => Promise<void>;
   sendTyping: (userId: string, contextToken: string) => Promise<void>;
 }
 
@@ -214,6 +221,32 @@ export class SessionManager {
     return { cancelledTurn: true, droppedQueueCount };
   }
 
+  /**
+   * Kill the agent process for a user and remove the session so the
+   * next enqueued message triggers a fresh `createSession()` — effectively
+   * resetting the ACP conversation context.
+   *
+   * Returns true if a session existed and was reset, false if no session
+   * was found.
+   */
+  resetSession(userId: string): boolean {
+    const session = this.sessions.get(userId);
+    if (!session) return false;
+
+    this.opts.log(`Resetting session for ${userId}`);
+
+    // Reject any queued completions so callers waiting on
+    // enqueueAndWait (e.g. local injection) don't hang forever.
+    this.rejectQueuedCompletions(session, new Error("Session reset before queued message was processed"));
+
+    // Cancel any in-flight ACP turn so the process won't linger.
+    session.agentInfo.connection.cancel({ sessionId: session.agentInfo.sessionId }).catch(() => {});
+
+    killAgent(session.agentInfo.process);
+    this.sessions.delete(userId);
+    return true;
+  }
+
   get activeCount(): number {
     return this.sessions.size;
   }
@@ -225,6 +258,9 @@ export class SessionManager {
       sendTyping: () => this.opts.sendTyping(userId, contextToken),
       onThoughtFlush: (text) => this.opts.onReply(userId, contextToken, text),
       onMessageFlush: (text) => this.opts.onReply(userId, contextToken, text),
+      ...(this.opts.onImage
+        ? { onImageFlush: (image) => this.opts.onImage!(userId, contextToken, image) }
+        : {}),
       onConfigOptionsUpdate: (configOptions) => {
         const session = this.sessions.get(userId);
         if (!session || session.client !== client) return;
@@ -289,6 +325,9 @@ export class SessionManager {
           sendTyping: () => this.opts.sendTyping(session.userId, pending.contextToken),
           onThoughtFlush: (text) => this.opts.onReply(session.userId, pending.contextToken, text),
           onMessageFlush: (text) => this.opts.onReply(session.userId, pending.contextToken, text),
+          ...(this.opts.onImage
+            ? { onImageFlush: (image) => this.opts.onImage!(session.userId, pending.contextToken, image) }
+            : {}),
         });
 
         // Reset chunks for the new turn

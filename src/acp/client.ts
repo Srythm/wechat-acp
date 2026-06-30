@@ -13,6 +13,12 @@ export interface WeChatAcpClientOpts {
   sendTyping: () => Promise<void>;
   onThoughtFlush: (text: string) => Promise<void>;
   onMessageFlush: (text: string) => Promise<void>;
+  /**
+   * Called when the agent produces an image content block in its reply.
+   * The image is passed as the raw ACP ImageContent (base64 `data` +
+   * `mimeType`). If not provided, image output is dropped.
+   */
+  onImageFlush?: (image: acp.ImageContent) => Promise<void>;
   onConfigOptionsUpdate?: (configOptions: acp.SessionConfigOption[]) => void;
   log: (msg: string) => void;
   showThoughts: boolean;
@@ -22,12 +28,19 @@ export interface WeChatAcpClientOpts {
 export class WeChatAcpClient implements acp.Client {
   private chunks: string[] = [];
   private thoughtChunks: string[] = [];
+  // Accumulated image content blocks produced by the agent this turn.
+  // Flushed (drained) at thought/tool_call boundaries and at the final
+  // flush(), mirroring how text chunks are delivered to WeChat.
+  private imageBlocks: acp.ImageContent[] = [];
   private opts: WeChatAcpClientOpts;
   private lastTypingAt = 0;
   private producedMessageThisTurn = false;
   // Promise chain serializing onMessageFlush calls so concurrent boundary events
   // cannot interleave sends (e.g. chunk B reaching WeChat before chunk A).
   private messageFlushChain: Promise<void> = Promise.resolve();
+  // Separate chain for image sends so image delivery cannot race with text
+  // delivery to the same user (one CDN upload + send at a time per turn).
+  private imageFlushChain: Promise<void> = Promise.resolve();
   private static readonly TYPING_INTERVAL_MS = 5_000;
   private static readonly SEND_MAX_ATTEMPTS = 3;
   private static readonly SEND_RETRY_BASE_MS = 300;
@@ -50,12 +63,16 @@ export class WeChatAcpClient implements acp.Client {
     sendTyping: () => Promise<void>;
     onThoughtFlush: (text: string) => Promise<void>;
     onMessageFlush: (text: string) => Promise<void>;
+    onImageFlush?: (image: acp.ImageContent) => Promise<void>;
   }): void {
     this.opts = {
       ...this.opts,
       sendTyping: callbacks.sendTyping,
       onThoughtFlush: callbacks.onThoughtFlush,
       onMessageFlush: callbacks.onMessageFlush,
+      ...(callbacks.onImageFlush !== undefined
+        ? { onImageFlush: callbacks.onImageFlush }
+        : {}),
     };
   }
 
@@ -89,6 +106,12 @@ export class WeChatAcpClient implements acp.Client {
           if (update.content.text.trim()) {
             this.producedMessageThisTurn = true;
           }
+        } else if (update.content.type === "image") {
+          // Drain any buffered text first so text-before-image ordering is
+          // preserved on the receiving end, then queue the image for delivery.
+          await this.maybeFlushMessage();
+          this.imageBlocks.push(update.content);
+          this.producedMessageThisTurn = true;
         }
         // Throttle typing indicators
         await this.maybeSendTyping();
@@ -97,12 +120,14 @@ export class WeChatAcpClient implements acp.Client {
       case "tool_call":
         await this.maybeFlushThoughts();
         await this.maybeFlushMessage();
+        await this.maybeFlushImages();
         this.opts.log(`[tool] ${update.title} (${update.status})`);
         await this.maybeSendTyping();
         break;
 
       case "agent_thought_chunk":
         await this.maybeFlushMessage();
+        await this.maybeFlushImages();
         if (update.content.type === "text") {
           const text = update.content.text;
           this.opts.log(`[thought] ${text.length > 80 ? text.substring(0, 80) + "..." : text}`);
@@ -182,6 +207,9 @@ export class WeChatAcpClient implements acp.Client {
     // Drain any in-flight sends (queued by maybeFlushMessage) before reading
     // the buffer so a retried-and-restored flush cannot race with this read.
     await this.messageFlushChain.catch(() => {});
+    // Deliver any accumulated image blocks before returning the final text,
+    // so images produced during the turn are pushed to WeChat.
+    await this.maybeFlushImages();
     const text = this.chunks.join("");
     this.chunks = [];
     this.lastTypingAt = 0;
@@ -245,6 +273,53 @@ export class WeChatAcpClient implements acp.Client {
         this.opts.log(
           `[flush] message send failed after retries; retaining ${text.length} chars for final flush`,
         );
+      }
+    } finally {
+      resolve();
+    }
+  }
+
+  /**
+   * Deliver accumulated image content blocks to WeChat, one at a time,
+   * in arrival order. Like {@link maybeFlushMessage} this drains the
+   * buffer synchronously before awaiting so concurrent sessionUpdate
+   * notifications don't re-send the same image.
+   *
+   * Images are uploaded to the WeChat CDN by the bridge (see
+   * {@link WeChatAcpBridge.sendImageReply}) and referenced from a BOT
+   * message, so each flush is a multi-step network call and is serialized
+   * via {@link imageFlushChain} to avoid racing uploads for the same turn.
+   */
+  private async maybeFlushImages(): Promise<void> {
+    if (this.imageBlocks.length === 0) return;
+    if (!this.opts.onImageFlush) {
+      // No image sink wired — drop and log so it's visible.
+      const dropped = this.imageBlocks.length;
+      this.imageBlocks = [];
+      this.opts.log(`[flush] dropping ${dropped} image block(s): no onImageFlush wired`);
+      return;
+    }
+    const images = this.imageBlocks;
+    this.imageBlocks = [];
+
+    // Serialize image sends on a per-turn chain so concurrent boundary
+    // flushes cannot interleave CDN uploads.
+    const prev = this.imageFlushChain;
+    let resolve!: () => void;
+    this.imageFlushChain = new Promise<void>((r) => {
+      resolve = r;
+    });
+    await prev.catch(() => {});
+
+    try {
+      for (const image of images) {
+        const ok = await this.sendWithRetry(
+          () => this.opts.onImageFlush!(image),
+          "image",
+        );
+        if (!ok) {
+          this.opts.log(`[flush] image send failed after retries; dropping image`);
+        }
       }
     } finally {
       resolve();

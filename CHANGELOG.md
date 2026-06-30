@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `/acp-reset` bridge chat command to kill the agent subprocess for the current user and remove the session, so the next message starts a fresh conversation. Useful when the agent's context window is filling up or you want to switch topics completely. Adds one telemetry event: `command.acp_reset` (with `hadSession`). Total event types: 16.
+
 ## 0.8.0
 
 - Hide ACP file diffs by default. Use `--show-diffs` or `agent.showDiffs: true` to forward diffs to WeChat.

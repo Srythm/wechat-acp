@@ -7,16 +7,18 @@
 
 import type * as acp from "@agentclientprotocol/sdk";
 import crypto from "node:crypto";
+import path from "node:path";
+import { readFile } from "node:fs/promises";
 import { login, loadToken, type TokenData } from "./weixin/auth.js";
 import { startMonitor } from "./weixin/monitor.js";
-import { sendTextMessage, splitText } from "./weixin/send.js";
+import { sendTextMessage, sendImageMessage, splitText, extractImagePaths } from "./weixin/send.js";
 import { sendTyping, getConfig } from "./weixin/api.js";
 import { TypingStatus, MessageType } from "./weixin/types.js";
 import type { WeixinMessage } from "./weixin/types.js";
 import { SessionManager } from "./acp/session.js";
 import { weixinMessageToPrompt } from "./adapter/inbound.js";
 import type { WeChatAcpConfig } from "./config.js";
-import { BRIDGE_COMMANDS, resolveCommandAliases, resolveCommandNames } from "./config.js";
+import { BRIDGE_COMMANDS, resolveCommandAliases, resolveCommandNames, DEFAULT_SYSTEM_PROMPT } from "./config.js";
 import { InjectionMonitor } from "./inject/monitor.js";
 import type { InjectedMessage } from "./inject/types.js";
 import { resolveUserTarget, updateLastActiveUser } from "./storage/state.js";
@@ -24,6 +26,7 @@ import { trackEvent, trackException, hashUserId } from "./telemetry/index.js";
 
 const ACP_CONFIG_COMMAND = BRIDGE_COMMANDS.acpConfig;
 const ACP_CANCEL_COMMAND = BRIDGE_COMMANDS.acpCancel;
+const ACP_RESET_COMMAND = BRIDGE_COMMANDS.acpReset;
 const BUFFER_START_COMMAND = BRIDGE_COMMANDS.promptStart;
 const BUFFER_DONE_COMMAND = BRIDGE_COMMANDS.promptDone;
 const TEXT_CHUNK_LIMIT = 4000;
@@ -134,6 +137,7 @@ export class WeChatAcpBridge {
       showDiffs: this.config.agent.showDiffs ?? false,
       log: this.log,
       onReply: (userId, contextToken, text) => this.sendReply(userId, contextToken, text),
+      onImage: (userId, contextToken, image) => this.sendImageReply(userId, contextToken, image),
       sendTyping: (userId, contextToken) => this.sendTypingIndicator(userId, contextToken),
     });
     this.sessionManager.start();
@@ -213,6 +217,12 @@ export class WeChatAcpBridge {
       return;
     }
 
+    const acpResetCommand = this.extractAcpResetCommand(msg);
+    if (acpResetCommand) {
+      this.handleAcpResetCommand(userId, contextToken);
+      return;
+    }
+
     // /acp-prompt-start — enter buffering mode
     if (this.isBufferStartCommand(msg)) {
       this.handleBufferStart(userId, contextToken);
@@ -257,7 +267,30 @@ export class WeChatAcpBridge {
       this.config.storage.inboxDir,
     );
 
-    await this.sessionManager!.enqueue(userId, { prompt, contextToken });
+    // Prepend the system prompt (if configured) as the first text block so
+    // the agent knows about bridge capabilities — notably that referencing
+    // local image files in its reply will forward them as WeChat images.
+    // ACP has no separate systemPrompt field, so the convention is to send
+    // it as a leading text content block in the prompt array.
+    const systemPrompt = this.resolveSystemPrompt();
+    const finalPrompt = systemPrompt
+      ? [{ type: "text" as const, text: systemPrompt }, ...prompt]
+      : prompt;
+
+    await this.sessionManager!.enqueue(userId, { prompt: finalPrompt, contextToken });
+  }
+
+  /**
+   * Resolve the effective system prompt: explicit config value wins,
+   * `null` disables injection, `undefined` falls back to the default
+   * {@link DEFAULT_SYSTEM_PROMPT} that informs the agent about the
+   * image-forwarding capability.
+   */
+  private resolveSystemPrompt(): string | null {
+    const configured = this.config.agent.systemPrompt;
+    if (configured === null) return null;
+    if (configured !== undefined) return configured;
+    return DEFAULT_SYSTEM_PROMPT;
   }
 
   private async enqueueInjectedMessage(job: InjectedMessage): Promise<void> {
@@ -414,6 +447,44 @@ export class WeChatAcpBridge {
     lines.push(`   • Cancel current turn:        ${ACP_CANCEL_COMMAND}${this.aliasHint(ACP_CANCEL_COMMAND)}`);
     lines.push(`   • Cancel + drop queued msgs:  ${ACP_CANCEL_COMMAND} all`);
     return lines.join("\n");
+  }
+
+  private extractAcpResetCommand(msg: WeixinMessage): string | null {
+    return this.extractBridgeCommand(msg, ACP_RESET_COMMAND);
+  }
+
+  private handleAcpResetCommand(userId: string, contextToken: string): void {
+    if (!this.sessionManager) {
+      this.sendReply(userId, contextToken, this.formatAcpResetResult(false)).catch((err) => {
+        this.log(`Failed to send reset reply to ${userId}: ${String(err)}`);
+      });
+      return;
+    }
+
+    const existed = this.sessionManager.resetSession(userId);
+
+    const msg = this.formatAcpResetResult(existed);
+    this.log(`Reset session for ${userId}: ${existed ? "killed agent" : "no session"}`);
+
+    trackEvent(
+      "command.acp_reset",
+      {
+        userIdHash: hashUserId(userId),
+        hadSession: existed,
+      },
+      hashUserId(userId),
+    );
+
+    this.sendReply(userId, contextToken, msg).catch((err) => {
+      this.log(`Failed to send reset reply to ${userId}: ${String(err)}`);
+    });
+  }
+
+  private formatAcpResetResult(existed: boolean): string {
+    if (existed) {
+      return `🔄 Session reset. The next message will start a fresh conversation with a new agent subprocess.`;
+    }
+    return `ℹ️ No active session to reset. Send any message to start a new conversation.`;
   }
 
   private isBufferStartCommand(msg: WeixinMessage): boolean {
@@ -610,6 +681,58 @@ export class WeChatAcpBridge {
   }
 
   private async deliverReply(userId: string, contextToken: string, text: string): Promise<void> {
+    // Scan the reply text for local image file references (markdown image
+    // syntax, file:// URLs, or bare paths with image extensions). For each
+    // found image: read the file, upload to WeChat CDN and send as an image
+    // message, then strip the reference from the text so the user doesn't
+    // see a raw path in the text reply.
+    //
+    // Send order is text-then-image: the cleaned text is sent first, then
+    // the images. This matches the agent's natural output order (a caption
+    // like "here is the plot:" precedes the image) and stays consistent with
+    // the ACP image-block path in client.ts (maybeFlushMessage before
+    // maybeFlushImages).
+    const agentCwd = this.config.agent.cwd;
+    const images = extractImagePaths(text, agentCwd);
+    let cleanedText = text;
+    const sentImages: string[] = [];
+
+    // Strip image references from the text first so we can decide whether
+    // there's any text left to send.
+    for (const img of images) {
+      cleanedText = cleanedText.split(img.rawMatch).join("");
+    }
+    cleanedText = cleanedText.replace(/\n{3,}/g, "\n\n").trim();
+
+    // 1. Send the cleaned text (if any). If all text was just image refs and
+    //    we have images to send, skip the empty text message.
+    if (cleanedText || images.length === 0) {
+      await this.deliverTextSegments(userId, contextToken, cleanedText);
+    }
+
+    // 2. Send each extracted image in order. File read / send failures are
+    //    logged but do not abort the remaining images.
+    for (const img of images) {
+      const sent = await this.deliverImageFromFile(userId, contextToken, img.absPath);
+      if (sent) {
+        sentImages.push(img.absPath);
+      }
+    }
+
+    // Cancel typing indicator after reply is sent
+    this.cancelTypingIndicator(userId, contextToken).catch(() => {});
+  }
+
+  /**
+   * Send text in segments of at most {@link TEXT_CHUNK_LIMIT} chars, with
+   * per-segment retry and idempotency keys. Extracted from {@link deliverReply}
+   * so the image-forwarding path can reuse the same send/retry logic.
+   */
+  private async deliverTextSegments(
+    userId: string,
+    contextToken: string,
+    text: string,
+  ): Promise<void> {
     const segments = splitText(text, TEXT_CHUNK_LIMIT);
     const startedAt = Date.now();
     let segmentsSent = 0;
@@ -677,8 +800,167 @@ export class WeChatAcpBridge {
       },
       hashUserId(userId),
     );
+  }
 
-    // Cancel typing indicator after reply is sent
+  /**
+   * Read a local image file and send it to a WeChat user as an image message
+   * via the WeChat CDN. Returns true on success, false on failure (file
+   * missing, unreadable, or send failed after retries). Failures are logged
+   * and tracked but do not throw, so a missing image doesn't block the
+   * accompanying text reply.
+   */
+  private async deliverImageFromFile(
+    userId: string,
+    contextToken: string,
+    absPath: string,
+  ): Promise<boolean> {
+    try {
+      const buffer = await readFile(absPath);
+      const clientId = `wechat-acp-img-${crypto.randomUUID()}`;
+      const startedAt = Date.now();
+
+      for (let attempt = 1; attempt <= SEGMENT_SEND_MAX_ATTEMPTS; attempt++) {
+        try {
+          await this.paceConsecutiveSend(userId);
+          await sendImageMessage(
+            userId,
+            buffer,
+            {
+              baseUrl: this.tokenData!.baseUrl,
+              token: this.tokenData!.token,
+              contextToken,
+              cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+            },
+            clientId,
+          );
+          this.log(`Image sent: ${path.basename(absPath)}`);
+
+          trackEvent(
+            "reply.sent",
+            {
+              userIdHash: hashUserId(userId),
+              segments: 1,
+              segmentsSent: 1,
+              chars: buffer.length,
+              durationMs: Date.now() - startedAt,
+            },
+            hashUserId(userId),
+          );
+          return true;
+        } catch (err) {
+          trackException(err, "reply.image", hashUserId(userId));
+          if (attempt < SEGMENT_SEND_MAX_ATTEMPTS) {
+            await new Promise((r) => setTimeout(r, SEGMENT_SEND_RETRY_BASE_MS * attempt));
+          }
+        }
+      }
+
+      this.log(`Image send failed after retries: ${path.basename(absPath)}`);
+      trackException(
+        new Error(`deliverImageFromFile: failed after ${SEGMENT_SEND_MAX_ATTEMPTS} attempts: ${absPath}`),
+        "reply.image",
+        hashUserId(userId),
+      );
+      return false;
+    } catch (err) {
+      // File missing / unreadable — log and continue so the text reply still goes out.
+      this.log(`Image file not readable, skipping: ${path.basename(absPath)}`);
+      trackException(err, "reply.image", hashUserId(userId));
+      return false;
+    }
+  }
+
+  /**
+   * Deliver an agent-produced image to a WeChat user.
+   *
+   * The ACP {@link acp.ImageContent} carries base64-encoded image data and a
+   * MIME type. We decode it to a raw buffer, upload it to the WeChat CDN via
+   * {@link sendImageMessage}, and send a BOT message that references the
+   * uploaded media so the recipient's WeChat client renders the image.
+   *
+   * Serialized on the same per-user send chain as {@link sendReply} so an
+   * image and adjacent text segments to the same user are delivered in the
+   * order the agent produced them, never interleaved.
+   */
+  private async sendImageReply(
+    userId: string,
+    contextToken: string,
+    image: acp.ImageContent,
+  ): Promise<void> {
+    const previous = this.sendChains.get(userId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => {})
+      .then(() => this.deliverImageReply(userId, contextToken, image));
+    this.sendChains.set(
+      userId,
+      current.catch(() => {}),
+    );
+    return current;
+  }
+
+  private async deliverImageReply(
+    userId: string,
+    contextToken: string,
+    image: acp.ImageContent,
+  ): Promise<void> {
+    if (!image.data) {
+      this.log(`Skipping image reply to ${userId}: empty data`);
+      return;
+    }
+    const buffer = Buffer.from(image.data, "base64");
+    if (buffer.length === 0) {
+      this.log(`Skipping image reply to ${userId}: decoded buffer is empty`);
+      return;
+    }
+
+    const clientId = `wechat-acp-img-${crypto.randomUUID()}`;
+    const startedAt = Date.now();
+    let sent = false;
+
+    for (let attempt = 1; attempt <= SEGMENT_SEND_MAX_ATTEMPTS; attempt++) {
+      try {
+        await this.paceConsecutiveSend(userId);
+        await sendImageMessage(
+          userId,
+          buffer,
+          {
+            baseUrl: this.tokenData!.baseUrl,
+            token: this.tokenData!.token,
+            contextToken,
+            cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+          },
+          clientId,
+        );
+        sent = true;
+        break;
+      } catch (err) {
+        trackException(err, "reply.image", hashUserId(userId));
+        if (attempt < SEGMENT_SEND_MAX_ATTEMPTS) {
+          await new Promise((r) => setTimeout(r, SEGMENT_SEND_RETRY_BASE_MS * attempt));
+        }
+      }
+    }
+
+    if (!sent) {
+      trackException(
+        new Error(`deliverImageReply: image failed to send after ${SEGMENT_SEND_MAX_ATTEMPTS} attempts`),
+        "reply.image",
+        hashUserId(userId),
+      );
+    }
+
+    trackEvent(
+      "reply.sent",
+      {
+        userIdHash: hashUserId(userId),
+        segments: 1,
+        segmentsSent: sent ? 1 : 0,
+        chars: buffer.length,
+        durationMs: Date.now() - startedAt,
+      },
+      hashUserId(userId),
+    );
+
     this.cancelTypingIndicator(userId, contextToken).catch(() => {});
   }
 

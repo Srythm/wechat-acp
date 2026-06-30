@@ -19,6 +19,7 @@ import { WeChatAcpClient } from "../src/acp/client.js";
 function makeClient(opts: {
   onMessageFlush?: (text: string) => Promise<void>;
   onThoughtFlush?: (text: string) => Promise<void>;
+  onImageFlush?: (image: { data: string; mimeType: string }) => Promise<void>;
   sendDelay?: number;
 }): WeChatAcpClient {
   const { sendDelay = 0 } = opts;
@@ -36,6 +37,7 @@ function makeClient(opts: {
       (async () => {
         if (sendDelay) await delay(sendDelay);
       }),
+    ...(opts.onImageFlush ? { onImageFlush: opts.onImageFlush } : {}),
     log: () => {},
     showThoughts: false,
   });
@@ -56,6 +58,16 @@ async function emitToolCall(client: WeChatAcpClient): Promise<void> {
 async function emitThoughtChunk(client: WeChatAcpClient, text = "thinking…"): Promise<void> {
   await client.sessionUpdate({
     update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text } },
+  } as never);
+}
+
+async function emitImageChunk(
+  client: WeChatAcpClient,
+  data = "ZmFrZS1pbWFnZS1kYXRh",
+  mimeType = "image/png",
+): Promise<void> {
+  await client.sessionUpdate({
+    update: { sessionUpdate: "agent_message_chunk", content: { type: "image", data, mimeType } },
   } as never);
 }
 
@@ -186,4 +198,84 @@ test("two sequential flushes are delivered in order (second waits for first)", a
   await Promise.all([p1, p2]);
 
   assert.deepEqual(order, ["chunk A", "chunk B"], "second message must arrive after first");
+});
+
+// ---------------------------------------------------------------------------
+// Image content tests
+// ---------------------------------------------------------------------------
+
+test("image chunk is flushed via onImageFlush at tool_call boundary", async () => {
+  const images: { data: string; mimeType: string }[] = [];
+  const client = makeClient({
+    onImageFlush: async (img) => { images.push(img); },
+  });
+
+  await emitImageChunk(client, "YQ==", "image/png");
+  await emitToolCall(client);
+
+  assert.equal(images.length, 1, "image must be flushed at tool_call boundary");
+  assert.equal(images[0].data, "YQ==");
+  assert.equal(images[0].mimeType, "image/png");
+});
+
+test("image is flushed at final flush()", async () => {
+  const images: { data: string; mimeType: string }[] = [];
+  const client = makeClient({
+    onImageFlush: async (img) => { images.push(img); },
+  });
+
+  await emitImageChunk(client, "YmI=", "image/jpeg");
+  await client.flush();
+
+  assert.equal(images.length, 1, "image must be delivered at final flush");
+  assert.equal(images[0].data, "YmI=");
+});
+
+test("text before image is flushed first so ordering is preserved", async () => {
+  const order: string[] = [];
+  const client = makeClient({
+    onMessageFlush: async (t) => { order.push(`text:${t}`); },
+    onImageFlush: async (img) => { order.push(`image:${img.data}`); },
+  });
+
+  await emitMessageChunk(client, "here is a diagram");
+  await emitImageChunk(client, "Yw==", "image/png");
+  await emitToolCall(client);
+
+  assert.deepEqual(
+    order,
+    ["text:here is a diagram", "image:Yw=="],
+    "text must be flushed before the image that follows it",
+  );
+});
+
+test("multiple images are flushed in arrival order", async () => {
+  const images: string[] = [];
+  const client = makeClient({
+    onImageFlush: async (img) => { images.push(img.data); },
+  });
+
+  await emitImageChunk(client, "img1");
+  await emitImageChunk(client, "img2");
+  await emitImageChunk(client, "img3");
+  await client.flush();
+
+  assert.deepEqual(images, ["img1", "img2", "img3"], "images must preserve arrival order");
+});
+
+test("no onImageFlush wired → image is dropped with a log (no throw)", async () => {
+  const logs: string[] = [];
+  const client = new WeChatAcpClient({
+    sendTyping: async () => {},
+    onThoughtFlush: async () => {},
+    onMessageFlush: async () => {},
+    log: (msg) => { logs.push(msg); },
+    showThoughts: false,
+  });
+
+  await emitImageChunk(client, "ZHJvcA==", "image/png");
+  await client.flush();
+
+  const dropLog = logs.find((l) => l.includes("dropping") && l.includes("image"));
+  assert.ok(dropLog, "must log that the image was dropped");
 });

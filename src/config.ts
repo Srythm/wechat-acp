@@ -100,6 +100,7 @@ export const BUILT_IN_AGENTS: Record<string, AgentPreset> = {
 export const BRIDGE_COMMANDS = {
   acpConfig: "/acp-config",
   acpCancel: "/acp-cancel",
+  acpReset: "/acp-reset",
   promptStart: "/acp-prompt-start",
   promptDone: "/acp-prompt-done",
 } as const;
@@ -126,6 +127,14 @@ export interface WeChatAcpConfig {
     env?: Record<string, string>;
     showThoughts: boolean;
     showDiffs?: boolean;
+    /**
+     * System prompt text prepended to every user message sent to the
+     * agent. Used to inform the agent about bridge capabilities (e.g.
+     * "you can show images by referencing local file paths"). Set to
+     * `null` to disable system prompt injection entirely. When
+     * undefined, {@link DEFAULT_SYSTEM_PROMPT} is used.
+     */
+    systemPrompt?: string | null;
   };
   agents: Record<string, AgentPreset>;
   session: {
@@ -153,6 +162,26 @@ export interface WeChatAcpConfig {
     inboxDir?: string | null;
   };
 }
+
+/**
+ * Default system prompt injected before each user message to inform the
+ * agent about the bridge's image-forwarding capability.
+ *
+ * The bridge scans the agent's text reply for local image file references
+ * (markdown `![](path)`, `file://` URLs, or paths with image extensions)
+ * and forwards them as WeChat image messages. This prompt tells the agent
+ * how to trigger that behavior so it knows to reference generated image
+ * files in its reply instead of only describing them.
+ */
+export const DEFAULT_SYSTEM_PROMPT = [
+  "You are chatting with a user through WeChat via the wechat-acp bridge.",
+  "The bridge can display images to the user by sending them as WeChat image messages.",
+  "When you generate or reference a local image file (e.g. a plot, diagram, screenshot, or any .png/.jpg/.jpeg/.gif/.webp/.bmp file), include it in your reply using markdown image syntax so the bridge can forward it:",
+  "  ![short description](relative/path/to/image.png)",
+  "The path is resolved relative to the current working directory. Both absolute paths and file:// URLs also work.",
+  "Do NOT just mention the filename in prose (e.g. \"saved to plot.png\") — use the markdown image syntax so the image is actually shown to the user.",
+  "Only reference image files that actually exist on disk; do not fabricate paths.",
+].join("\n");
 
 const INSTANCE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
