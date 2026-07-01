@@ -62,37 +62,44 @@ export async function spawnAgent(params: {
   const connection = new acp.ClientSideConnection(() => client, stream);
 
   // Initialize
-  log("Initializing ACP connection...");
-  const initResult = await connection.initialize({
-    protocolVersion: acp.PROTOCOL_VERSION,
-    clientInfo: {
-      name: packageJson.name,
-      title: packageJson.name,
-      version: packageJson.version,
-    },
-    clientCapabilities: {
-      fs: {
-        readTextFile: true,
-        writeTextFile: true,
+  try {
+    log("Initializing ACP connection...");
+    const initResult = await connection.initialize({
+      protocolVersion: acp.PROTOCOL_VERSION,
+      clientInfo: {
+        name: packageJson.name,
+        title: packageJson.name,
+        version: packageJson.version,
       },
-    },
-  });
-  log(`ACP initialized (protocol v${initResult.protocolVersion})`);
+      clientCapabilities: {
+        fs: {
+          readTextFile: true,
+          writeTextFile: true,
+        },
+      },
+    });
+    log(`ACP initialized (protocol v${initResult.protocolVersion})`);
 
-  // Create session
-  log("Creating ACP session...");
-  const sessionResult = await connection.newSession({
-    cwd,
-    mcpServers: [],
-  });
-  log(`ACP session created: ${sessionResult.sessionId}`);
+    // Create session
+    log("Creating ACP session...");
+    const sessionResult = await connection.newSession({
+      cwd,
+      mcpServers: [],
+    });
+    log(`ACP session created: ${sessionResult.sessionId}`);
 
-  return {
-    process: proc,
-    connection,
-    sessionId: sessionResult.sessionId,
-    configOptions: sessionResult.configOptions ?? [],
-  };
+    return {
+      process: proc,
+      connection,
+      sessionId: sessionResult.sessionId,
+      configOptions: sessionResult.configOptions ?? [],
+    };
+  } catch (err) {
+    throw err instanceof Error ? err : new Error(
+      typeof err === "object" ? JSON.stringify(err) : String(err)
+    );
+  }
+
 }
 
 export function killAgent(proc: ChildProcess): void {
