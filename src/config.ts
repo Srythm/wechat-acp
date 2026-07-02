@@ -55,8 +55,8 @@ export const BUILT_IN_AGENTS: Record<string, AgentPreset> = {
   },
   opencode: {
     label: "OpenCode",
-    command: "npx",
-    args: ["opencode-ai", "acp"],
+    command: "opencode",
+    args: ["acp"],
     description: "OpenCode",
   },
   openclaw: {
